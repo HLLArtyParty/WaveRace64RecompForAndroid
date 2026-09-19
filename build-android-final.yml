@@ -1,0 +1,82 @@
+name: Wave Race Android maintainer
+
+on:
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: read
+
+jobs:
+  maintainer-patch:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, '/maintainer-patch ')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Apply maintainer patch
+        shell: bash
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          PAYLOAD="${COMMENT_BODY#"/maintainer-patch "}"
+          printf '%s' "$PAYLOAD" | base64 --decode > /tmp/wr64-maintainer-patch.sh
+          chmod +x /tmp/wr64-maintainer-patch.sh
+          /tmp/wr64-maintainer-patch.sh
+
+          # Never let the bridge modify workflow files. This workflow is the stable control plane.
+          if ! git diff --quiet -- .github/workflows; then
+            echo "Refusing patch: workflow files may not be changed through the maintainer bridge."
+            git checkout -- .github/workflows
+          fi
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git reset -- .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit -m "Apply maintainer patch"
+            git push
+          else
+            echo "No repository changes to commit."
+          fi
+
+      - name: Run Android bring-up after patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f ci/build.sh ]; then
+            echo "ci/build.sh does not exist yet."
+            exit 2
+          fi
+          chmod +x ci/build.sh
+          ci/build.sh
+
+  manual-build:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Android bring-up
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f ci/build.sh ]; then
+            echo "ci/build.sh does not exist yet."
+            exit 2
+          fi
+          chmod +x ci/build.sh
+          ci/build.sh
