@@ -1,0 +1,17 @@
+# ROMs / generated game code
+*.z64
+*.n64
+*.v64
+upstream/reference/
+upstream/RecompiledFuncs/
+upstream/build-*/
+upstream/build/
+
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+.android-prefixes/
+
+# Working checkout
+upstream/

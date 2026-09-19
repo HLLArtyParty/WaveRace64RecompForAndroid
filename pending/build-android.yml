@@ -1,0 +1,54 @@
+name: Android bring-up
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang lld ninja-build python3-venv binutils-mips-linux-gnu
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - uses: android-actions/setup-android@v3
+      - name: Install Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "ndk;27.1.12297006"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.1.12297006" >> "$GITHUB_ENV"
+      - name: Prepare source tree
+        run: scripts/prepare_upstream.sh
+      - name: Prepare Android dependencies
+        shell: bash
+        run: |
+          eval "$(scripts/setup_android_deps.sh | grep '^WR64_ANDROID_' | sed 's/^/export /')"
+          echo "WR64_ANDROID_SDL2_PREFIX=$WR64_ANDROID_SDL2_PREFIX" >> "$GITHUB_ENV"
+          echo "WR64_ANDROID_FREETYPE_PREFIX=$WR64_ANDROID_FREETYPE_PREFIX" >> "$GITHUB_ENV"
+      - name: Check generated recomp sources
+        shell: bash
+        run: |
+          if ! compgen -G 'upstream/RecompiledFuncs/*.c' >/dev/null; then
+            echo 'Generated RecompiledFuncs are not available on the runner.'
+            echo 'Generate them locally with scripts/generate_sources.sh using your own ROM, then supply a private source bundle to CI. ROMs must never be committed.'
+            exit 2
+          fi
+      - name: Build host file_to_c
+        shell: bash
+        run: |
+          mkdir -p build-host-tools
+          c++ -std=c++17 -O2 upstream/lib/RT64/src/tools/file_to_c/file_to_c.cpp -o build-host-tools/file_to_c
+          echo "WR64_ANDROID_FILE_TO_C=$GITHUB_WORKSPACE/build-host-tools/file_to_c" >> "$GITHUB_ENV"
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.10.2' }
+      - name: Build debug APK
+        run: gradle --no-daemon -p android :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WaveRace64Recomp-Android-debug
+          path: android/app/build/outputs/apk/debug/*.apk
