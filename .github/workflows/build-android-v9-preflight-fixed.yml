@@ -1,0 +1,608 @@
+name: Android bring-up v9 - validated Android RT64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Install host build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang lld cmake ninja-build git curl unzip zip xz-utils \
+            python3 python3-venv python3-dev binutils-mips-linux-gnu openssl
+
+      - name: Locate and install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -perm -111 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+          if [ -z "${SDKMANAGER:-}" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $ANDROID_HOME"
+            exit 10
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "cmake;3.22.1" \
+            "ndk;27.1.12297006"
+
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
+
+      - name: Decrypt and verify private Rev A build input
+        shell: bash
+        env:
+          WR64_ROM_KEY: ${{ secrets.WR64_ROM_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WR64_ROM_KEY:-}" ]; then
+            echo "::error::Repository secret WR64_ROM_KEY is missing."
+            exit 11
+          fi
+          if [ ! -f waverace_revA.z64.enc ]; then
+            echo "::error::Encrypted ROM input waverace_revA.z64.enc is missing from repo root."
+            exit 12
+          fi
+
+          mkdir -p "$RUNNER_TEMP/wr64-private"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -pass env:WR64_ROM_KEY \
+            -in waverace_revA.z64.enc \
+            -out "$RUNNER_TEMP/wr64-private/waverace_revA.z64"
+
+          ACTUAL="$(sha1sum "$RUNNER_TEMP/wr64-private/waverace_revA.z64" | awk '{print $1}')"
+          EXPECTED="508dfc2d4caa42b6f6de5263d0aed5e44ac7966a"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Decrypted ROM hash mismatch."
+            exit 13
+          fi
+          echo "Verified Wave Race 64 USA Rev A build input."
+
+      - name: Clone pinned Wave Race source and submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/elliotttate/wave-race-64-recomp.git upstream
+          git -C upstream checkout --detach 9041cc8024f6d2015859f88f5a0307b36cd4e50a
+          git -C upstream submodule update --init --recursive
+
+          mkdir -p upstream/reference
+          git clone https://github.com/LLONSIT/Wave-Race-64.git upstream/reference/wr64-decomp
+          git -C upstream/reference/wr64-decomp checkout --detach a51b38a2aaef68da10ea1e47247e70be3b1d4c70
+
+      - name: Build N64 recompilers and generate Wave Race native sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m venv "$RUNNER_TEMP/wr64venv"
+          "$RUNNER_TEMP/wr64venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/wr64venv/bin/pip" install \
+            PyYAML==6.0.3 pylibyaml==0.1.0 tqdm==4.67.1 \
+            intervaltree==3.1.0 colorama==0.4.6 spimdisasm==1.42.4 \
+            rabbitizer==1.16.2 pygfxd==1.0.5 n64img==0.3.3 crunch64==0.6.2
+
+          cd upstream
+          python3 tools/patch_n64recomp.py
+          python3 tools/patch_rsprecomp.py
+
+          cmake \
+            -S lib/N64ModernRuntime/N64Recomp \
+            -B build-tools \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-tools --target N64RecompCLI RSPRecomp --parallel 4
+
+          "$RUNNER_TEMP/wr64venv/bin/python" tools/generate_game.py \
+            "$RUNNER_TEMP/wr64-private/waverace_revA.z64"
+
+          test -f RecompiledFuncs/funcs.h
+          test -f RecompiledFuncs/aspMain_rsp.cpp
+          if ! compgen -G 'RecompiledFuncs/*.c' >/dev/null; then
+            echo "::error::N64Recomp produced no game C sources."
+            exit 20
+          fi
+
+          # The raw ROM is only needed for generation. Remove it before Android packaging.
+          rm -f "$RUNNER_TEMP/wr64-private/waverace_revA.z64"
+          rm -f reference/wr64-decomp/baserom.us.rev1.z64
+          rm -f wr64.elf
+
+      - name: Apply Wave Race runtime patches and Android compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd upstream
+
+          # Preserve the exact renderer stack this Wave Race revision was built against.
+          test "$(git -C lib/RT64 rev-parse HEAD)" = "5473732a822a4423b5696e7cb18fecc425a59875"
+          test "$(git -C lib/RT64/src/contrib/plume rev-parse HEAD)" = "d890ac899e505fb30040e037a4037cdeca68f033"
+
+          # Apply Wave Race's own documented runtime patch stack first.
+          python3 tools/patch_rt64.py
+          python3 tools/patch_librecomp.py
+          python3 tools/patch_water.py
+          python3 tools/patch_runtime_shutdown.py
+
+          test -f lib/RT64/src/shared/rt64_water_params.h
+          test -f lib/RT64/src/render/rt64_water_renderer.cpp
+          test -f lib/RT64/src/shaders/WaterVS.hlsl
+
+          cd ..
+
+          # Layer generic Android changes onto Wave Race's pinned RT64.
+          # NL=chr(10) deliberately avoids brittle escaped-newline matching.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          NL = chr(10)
+
+          def once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          rt = Path("upstream/lib/RT64")
+
+          # ---- RT64 CMake ---------------------------------------------------
+          p = rt / "CMakeLists.txt"
+          text = p.read_text()
+
+          old = NL.join([
+              "else()",
+              '    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")',
+              '        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")',
+          ])
+          new = NL.join([
+              "else()",
+              '    if (CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64" OR CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "AMD64")',
+              '        set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/src/contrib/dxc/bin/x64/dxc-linux")',
+          ])
+          text = once(text, old, new, "host DXC selection")
+
+          old = NL.join([
+              "set(ZSTD_LEGACY_SUPPORT OFF)",
+              "set(ZSTD_BUILD_STATIC ON)",
+              "set(ZSTD_BUILD_SHARED OFF)",
+          ])
+          new = NL.join([
+              "set(ZSTD_LEGACY_SUPPORT OFF)",
+              "set(ZSTD_BUILD_STATIC ON)",
+              "set(ZSTD_BUILD_SHARED OFF)",
+              "",
+              "if(ANDROID)",
+              '    set(ZSTD_BUILD_DICTBUILDER OFF CACHE BOOL "" FORCE)',
+              '    set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)',
+              "endif()",
+          ])
+          text = once(text, old, new, "Android zstd options")
+
+          text = once(
+              text,
+              "add_subdirectory(src/contrib/nativefiledialog-extended)",
+              NL.join([
+                  "if (NOT TARGET nfd)",
+                  "    add_subdirectory(src/contrib/nativefiledialog-extended)",
+                  "endif()",
+              ]),
+              "NFD target guard",
+          )
+
+          text = once(
+              text,
+              'set (DXC_COMMON_OPTS "-I${PROJECT_SOURCE_DIR}/src")',
+              NL.join([
+                  'set (DXC_COMMON_OPTS "-I${PROJECT_SOURCE_DIR}/src")',
+                  "if (ANDROID)",
+                  '    list(APPEND DXC_COMMON_OPTS "-D" "RT64_TEXTURE_CACHE_SIZE=1024")',
+                  "endif()",
+              ]),
+              "Android shader texture cache",
+          )
+
+          text = once(
+              text,
+              "add_subdirectory(src/tools/file_to_c)",
+              NL.join([
+                  "if(ANDROID)",
+                  "    if(NOT ZELDA_HOST_FILE_TO_C)",
+                  '        message(FATAL_ERROR "Android cross-compile requires -DZELDA_HOST_FILE_TO_C=/path/to/host/file_to_c")',
+                  "    endif()",
+                  '    set(FILE_TO_C "${ZELDA_HOST_FILE_TO_C}")',
+                  '    set(FILE_TO_C_DEP "${ZELDA_HOST_FILE_TO_C}")',
+                  "else()",
+                  "    add_subdirectory(src/tools/file_to_c)",
+                  "    set(FILE_TO_C file_to_c)",
+                  "    set(FILE_TO_C_DEP file_to_c)",
+                  "endif()",
+              ]),
+              "host file_to_c setup",
+          )
+
+          file_to_c_count = text.count("COMMAND file_to_c ")
+          if file_to_c_count != 4:
+              raise SystemExit(f"host file_to_c commands: expected four, found {file_to_c_count}")
+          text = text.replace("COMMAND file_to_c ", "COMMAND ${FILE_TO_C} ")
+
+          file_to_c_dep_count = text.count(" file_to_c" + NL)
+          if file_to_c_dep_count != 4:
+              raise SystemExit(f"host file_to_c dependencies: expected four, found {file_to_c_dep_count}")
+          text = text.replace(" file_to_c" + NL, " ${FILE_TO_C_DEP}" + NL)
+
+          old = NL.join([
+              'if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)',
+              '    add_compile_definitions("PLUME_SDL_VULKAN_ENABLED")',
+              '    add_compile_definitions("RT64_SDL_WINDOW_VULKAN")',
+              "endif()",
+          ])
+          new = NL.join([
+              'if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)',
+              '    add_compile_definitions("PLUME_SDL_VULKAN_ENABLED")',
+              '    add_compile_definitions("RT64_SDL_WINDOW_VULKAN")',
+              "endif()",
+              "",
+              "# Android uses Plume's native ANativeWindow Vulkan path, not Plume SDL Vulkan.",
+              "# RT64 itself still needs this define so SDL creates a Vulkan-capable window.",
+              "if (ANDROID AND RT64_SDL_WINDOW_VULKAN)",
+              '    add_compile_definitions("RT64_SDL_WINDOW_VULKAN")',
+              "endif()",
+          ])
+          text = once(text, old, new, "Android RT64 Vulkan compile definition")
+
+          p.write_text(text)
+
+          # ---- Descriptor pressure on mobile Vulkan ------------------------
+          p = rt / "src/render/rt64_descriptor_sets.h"
+          text = p.read_text()
+          text = once(
+              text,
+              "        static const int UpperRange = 8192;",
+              NL.join([
+                  "#if defined(__ANDROID__)",
+                  "        static const int UpperRange = 1024;",
+                  "#else",
+                  "        static const int UpperRange = 8192;",
+                  "#endif",
+              ]),
+              "Android descriptor upper range",
+          )
+          text = once(
+              text,
+              "            builder.end(true, textureCacheSize);",
+              NL.join([
+                  "#if defined(__ANDROID__)",
+                  "            builder.end();",
+                  "#else",
+                  "            builder.end(true, textureCacheSize);",
+                  "#endif",
+              ]),
+              "Android descriptor variable-count mode",
+          )
+          p.write_text(text)
+
+          p = rt / "src/shaders/FbRendererCommon.hlsli"
+          text = p.read_text()
+          text = once(
+              text,
+              "// Set 1 - RGBA32 texture cache.",
+              NL.join([
+                  "#ifndef RT64_TEXTURE_CACHE_SIZE",
+                  "#define RT64_TEXTURE_CACHE_SIZE 8192",
+                  "#endif",
+                  "",
+                  "// Set 1 - RGBA32 texture cache.",
+              ]),
+              "shader descriptor macro",
+          )
+          text = once(
+              text,
+              "Texture2D<float4> gTextures[8192] : register(t0, space1);",
+              "Texture2D<float4> gTextures[RT64_TEXTURE_CACHE_SIZE] : register(t0, space1);",
+              "shader RGBA descriptor range",
+          )
+          text = once(
+              text,
+              "Texture1D<uint> gTMEM[8192] : register(t0, space2);",
+              "Texture1D<uint> gTMEM[RT64_TEXTURE_CACHE_SIZE] : register(t0, space2);",
+              "shader TMEM descriptor range",
+          )
+          p.write_text(text)
+
+          p = rt / "src/render/rt64_framebuffer_renderer.cpp"
+          text = p.read_text()
+          text = once(
+              text,
+              "            descTextureSet = std::make_unique<FramebufferRendererDescriptorTextureSet>(worker->device, ((textureCacheSize + 1) * 3) / 2);",
+              NL.join([
+                  "#if defined(__ANDROID__)",
+                  "            descTextureSet = std::make_unique<FramebufferRendererDescriptorTextureSet>(worker->device, FramebufferRendererDescriptorTextureSet::UpperRange);",
+                  "#else",
+                  "            descTextureSet = std::make_unique<FramebufferRendererDescriptorTextureSet>(worker->device, ((textureCacheSize + 1) * 3) / 2);",
+                  "#endif",
+              ]),
+              "Android descriptor allocation",
+          )
+          p.write_text(text)
+
+          # ---- Android SDL window -> ANativeWindow -------------------------
+          p = rt / "src/hle/rt64_application_window.cpp"
+          text = p.read_text()
+
+          text = once(
+              text,
+              "#elif defined(__linux__)",
+              NL.join([
+                  "#elif defined(__ANDROID__)",
+                  "#   include <android/native_window.h>",
+                  "#elif defined(__linux__)",
+              ]),
+              "Android native-window include",
+          )
+
+          old = NL.join([
+              "#   elif defined(__ANDROID__)",
+              '        static_assert(false && "Android unimplemented");',
+              "#   elif defined(__linux__) || defined(__APPLE__)",
+          ])
+          new = NL.join([
+              "#   elif defined(__ANDROID__)",
+              "        if (SDL_VideoInit(nullptr) != 0) {",
+              '            printf("Failed to init SDL2 video: %s\\n", SDL_GetError());',
+              '            assert(false && "Failed to init SDL2 video");',
+              "            return;",
+              "        }",
+              "        SDL_DisplayMode dm = {};",
+              "        if (SDL_GetCurrentDisplayMode(0, &dm) != 0) {",
+              '            printf("Failed to get SDL2 current display mode: %s\\n", SDL_GetError());',
+              '            assert(false && "Failed to get SDL2 current display mode");',
+              "            return;",
+              "        }",
+              "        bounds.left = 0;",
+              "        bounds.top = 0;",
+              "        bounds.width = dm.w;",
+              "        bounds.height = dm.h;",
+              "#   elif defined(__linux__) || defined(__APPLE__)",
+          ])
+          text = once(text, old, new, "Android window bounds")
+
+          old = NL.join([
+              "#   elif defined(RT64_SDL_WINDOW_VULKAN)",
+              "        windowHandle = sdlWindow;",
+              "#   elif defined(__ANDROID__)",
+              '        static_assert(false && "Android unimplemented");',
+              "#   elif defined(__linux__)",
+          ])
+          new = NL.join([
+              "#   elif defined(__ANDROID__)",
+              "        assert(wmInfo.subsystem == SDL_SYSWM_ANDROID);",
+              "        windowHandle = wmInfo.info.android.window;",
+              "#   elif defined(RT64_SDL_WINDOW_VULKAN)",
+              "        windowHandle = sdlWindow;",
+              "#   elif defined(__linux__)",
+          ])
+          text = once(text, old, new, "Android native window handle")
+
+          old = NL.join([
+              "        fullScreen = newFullScreen;",
+              "#   elif defined(__APPLE__)",
+              "        windowWrapper->toggleFullscreen();",
+          ])
+          new = NL.join([
+              "        fullScreen = newFullScreen;",
+              "#   elif defined(__ANDROID__)",
+              "        fullScreen = newFullScreen;",
+              "#   elif defined(__APPLE__)",
+              "        windowWrapper->toggleFullscreen();",
+          ])
+          text = once(text, old, new, "Android fullscreen state")
+
+          old = NL.join([
+              "#   elif defined(__linux__)",
+              "        // Sourced from: https://stackoverflow.com/a/66865623",
+          ])
+          new = NL.join([
+              "#   elif defined(__ANDROID__)",
+              "        int displayIndex = (sdlWindow != nullptr) ? SDL_GetWindowDisplayIndex(sdlWindow) : 0;",
+              "        if (displayIndex < 0) displayIndex = 0;",
+              "        SDL_DisplayMode displayMode = {};",
+              "        if (SDL_GetCurrentDisplayMode(displayIndex, &displayMode) == 0) {",
+              "            refreshRate = displayMode.refresh_rate;",
+              "        }",
+              "#   elif defined(__linux__)",
+              "        // Sourced from: https://stackoverflow.com/a/66865623",
+          ])
+          text = once(text, old, new, "Android refresh-rate query")
+
+          old = NL.join([
+              "#   elif defined(RT64_SDL_WINDOW_VULKAN)",
+              "        SDL_GetWindowPosition(windowHandle, &newWindowLeft, &newWindowTop);",
+              "#   elif defined(__linux__)",
+          ])
+          new = NL.join([
+              "#   elif defined(__ANDROID__)",
+              "        return false;",
+              "#   elif defined(RT64_SDL_WINDOW_VULKAN)",
+              "        SDL_GetWindowPosition(windowHandle, &newWindowLeft, &newWindowTop);",
+              "#   elif defined(__linux__)",
+          ])
+          text = once(text, old, new, "Android window-move query")
+
+          p.write_text(text)
+
+          # Android phone/tablet Vulkan surfaces conventionally expose RGBA.
+          p = rt / "src/hle/rt64_application.cpp"
+          text = p.read_text()
+          text = once(
+              text,
+              "        swapChainDesc.format = RenderFormat::B8G8R8A8_UNORM;",
+              NL.join([
+                  "#if defined(__ANDROID__)",
+                  "        swapChainDesc.format = RenderFormat::R8G8B8A8_UNORM;",
+                  "#else",
+                  "        swapChainDesc.format = RenderFormat::B8G8R8A8_UNORM;",
+                  "#endif",
+              ]),
+              "Android swap-chain format",
+          )
+          p.write_text(text)
+          PY
+
+          python3 overlay/apply_android_overlay.py upstream
+
+          # Initial bring-up does not need the desktop RecompFrontend UI.
+          sed -i "s/'-DWR64_WITH_FRONTEND=ON'/'-DWR64_WITH_FRONTEND=OFF'/" android/app/build.gradle
+          grep -q -- "-DWR64_WITH_FRONTEND=OFF" android/app/build.gradle
+
+          # Do not run desktop replacement-asset validation/staging for the APK.
+          python3 - <<'PY'
+          from pathlib import Path
+          NL = chr(10)
+          p = Path("upstream/CMakeLists.txt")
+          s = p.read_text()
+          old = NL.join([
+              "if(WR64_WITH_RUNTIME AND WR64_WITH_RECOMPILED)",
+              "    find_package(Python3 REQUIRED COMPONENTS Interpreter)",
+              "    # These tracked replacements",
+          ])
+          new = NL.join([
+              "if(WR64_WITH_RUNTIME AND WR64_WITH_RECOMPILED AND NOT ANDROID)",
+              "    find_package(Python3 REQUIRED COMPONENTS Interpreter)",
+              "    # These tracked replacements",
+          ])
+          count = s.count(old)
+          if count != 1:
+              raise SystemExit(f"Wave Race asset-staging guard: expected one match, found {count}")
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Android port preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking preserved Wave Race renderer stack + Android deltas..."
+
+          test "$(git -C upstream/lib/RT64 rev-parse HEAD)" = "5473732a822a4423b5696e7cb18fecc425a59875"
+          test "$(git -C upstream/lib/RT64/src/contrib/plume rev-parse HEAD)" = "d890ac899e505fb30040e037a4037cdeca68f033"
+
+          test -f upstream/lib/RT64/src/shared/rt64_water_params.h
+          test -f upstream/lib/RT64/src/render/rt64_water_renderer.cpp
+          test -f upstream/lib/RT64/src/shaders/WaterVS.hlsl
+
+          grep -q "CMAKE_HOST_SYSTEM_PROCESSOR" upstream/lib/RT64/CMakeLists.txt
+          grep -q "ZSTD_BUILD_DICTBUILDER OFF" upstream/lib/RT64/CMakeLists.txt
+          grep -q "ZSTD_BUILD_PROGRAMS OFF" upstream/lib/RT64/CMakeLists.txt
+          grep -q 'set(FILE_TO_C "${ZELDA_HOST_FILE_TO_C}")' upstream/lib/RT64/CMakeLists.txt
+          test "$(grep -c 'COMMAND ${FILE_TO_C}' upstream/lib/RT64/CMakeLists.txt)" -eq 4
+          test "$(grep -c '${FILE_TO_C_DEP}' upstream/lib/RT64/CMakeLists.txt)" -ge 5
+          grep -q "RT64_TEXTURE_CACHE_SIZE=1024" upstream/lib/RT64/CMakeLists.txt
+          grep -q "if (ANDROID AND RT64_SDL_WINDOW_VULKAN)" upstream/lib/RT64/CMakeLists.txt
+
+          grep -q "wmInfo.info.android.window" upstream/lib/RT64/src/hle/rt64_application_window.cpp
+          grep -q "SDL_GetCurrentDisplayMode(displayIndex" upstream/lib/RT64/src/hle/rt64_application_window.cpp
+          grep -q "R8G8B8A8_UNORM" upstream/lib/RT64/src/hle/rt64_application.cpp
+          grep -q "UpperRange = 1024" upstream/lib/RT64/src/render/rt64_descriptor_sets.h
+
+          grep -q "minSdk 28" android/app/build.gradle
+          grep -q "27.1.12297006" android/app/build.gradle
+          grep -q "ZELDA_HOST_FILE_TO_C" android/app/build.gradle
+          grep -q -- "-DWR64_WITH_FRONTEND=OFF" android/app/build.gradle
+          grep -q "max-page-size=16384" upstream/CMakeLists.txt
+          grep -q "WR64_WITH_RECOMPILED AND NOT ANDROID" upstream/CMakeLists.txt
+          test -f upstream/src/android/nfd_android_stub.cpp
+
+          git -C upstream/lib/RT64 diff --check
+          git -C upstream/lib/N64ModernRuntime diff --check
+
+          # Do NOT rerun patch_water.py here: Wave Race's water patch is intentionally
+          # one-shot and rejects a checkout where its files/hunks are already present.
+          echo "Preflight passed."
+
+      - name: Build Android SDL2 and FreeType
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$(scripts/setup_android_deps.sh)"
+          printf '%s\n' "$OUT"
+
+          SDL_PREFIX="$(printf '%s\n' "$OUT" | sed -n 's/^WR64_ANDROID_SDL2_PREFIX=//p' | tail -n1)"
+          FT_PREFIX="$(printf '%s\n' "$OUT" | sed -n 's/^WR64_ANDROID_FREETYPE_PREFIX=//p' | tail -n1)"
+
+          test -n "$SDL_PREFIX"
+          test -n "$FT_PREFIX"
+
+          echo "WR64_ANDROID_SDL2_PREFIX=$SDL_PREFIX" >> "$GITHUB_ENV"
+          echo "WR64_ANDROID_FREETYPE_PREFIX=$FT_PREFIX" >> "$GITHUB_ENV"
+
+      - name: Build host file_to_c
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-host-tools
+          c++ -std=c++17 -O2 \
+            upstream/lib/RT64/src/tools/file_to_c/file_to_c.cpp \
+            -o build-host-tools/file_to_c
+          echo "WR64_ANDROID_FILE_TO_C=$GITHUB_WORKSPACE/build-host-tools/file_to_c" >> "$GITHUB_ENV"
+
+      - name: Build ARM64 Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Build matrix: arm64-v8a / API 28 / NDK 27.1.12297006 / CMake 3.22.1 / RelWithDebInfo"
+          gradle -p android :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Prove ROM was not packaged
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find android/app/build/outputs/apk/debug -name '*.apk' -print -quit)"
+          test -n "$APK"
+          unzip -l "$APK" > "$RUNNER_TEMP/apk-files.txt"
+          if grep -Ei '\.(z64|n64|v64)$|baserom|waverace_revA' "$RUNNER_TEMP/apk-files.txt"; then
+            echo "::error::A ROM-like file unexpectedly appears inside the APK."
+            exit 30
+          fi
+          echo "No ROM file is packaged in the APK."
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaveRace64Recomp-Android-arm64-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
