@@ -6,6 +6,8 @@ This repository contains **no Nintendo ROM data**. It expects a legally obtained
 
 Expected normalized ROM SHA-1: `508dfc2d4caa42b6f6de5263d0aed5e44ac7966a`.
 
+**Android port / maintainer:** [@bainface](https://x.com/bainface)
+
 ## MVP target
 
 - Android 9+ / API 28
